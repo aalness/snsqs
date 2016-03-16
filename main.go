@@ -188,7 +188,7 @@ func publish(topic, region string, r, b int, lm *latencyMeter, done chan struct{
 			message := randHexString(64)
 			lm.markSent(message)
 			batch.Messages = append(batch.Messages, message)
-			if b == 0 || b%len(batch.Messages) == 0 {
+			if b == 0 || len(batch.Messages)%b == 0 {
 				opts := &sns.PublishOpt{}
 				msg, err := json.Marshal(batch)
 				if err != nil {
@@ -269,25 +269,24 @@ func subscribe(topic, region, account string, lm *latencyMeter, done chan struct
 					fmt.Println(err)
 					return
 				}
-				if total == 0 {
-					mu.Lock()
-					t := total
-					mu.Unlock()
-					if t == 0 {
-						start = time.Now()
-					}
-				}
 				for _, msg := range resp.Messages {
+					if total == 0 {
+						mu.Lock()
+						t := total
+						mu.Unlock()
+						if t == 0 {
+							start = time.Now()
+						}
+					}
 					var m JSONMessage
 					if err := json.Unmarshal([]byte(msg.Body), &m); err != nil {
 						panic(err)
 					}
-					var b Batch
-					if err := json.Unmarshal([]byte(m.Message), &b); err != nil {
+					var batch Batch
+					if err := json.Unmarshal([]byte(m.Message), &batch); err != nil {
 						panic(err)
 					}
-					for _, s := range b.Messages {
-						fmt.Println(s)
+					for _, s := range batch.Messages {
 						lm.markReceived(s)
 						mu.Lock()
 						total++
