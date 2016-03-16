@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -10,8 +11,8 @@ import (
 	"time"
 
 	"github.com/goamz/goamz/aws"
-	"github.com/goamz/goamz/sqs"
 	"github.com/goamz/goamz/exp/sns"
+	"github.com/goamz/goamz/sqs"
 	"github.com/golang/time/rate"
 )
 
@@ -33,6 +34,14 @@ const (
 	letterIdxMax  = 63 / letterIdxBits   // # of letter indices fitting in 63 bits
 )
 
+type JSONMessage struct {
+	Message string `json:"Message"`
+}
+
+type Batch struct {
+	Messages []string `json:"Messages"`
+}
+
 func randHexString(n int) string {
 	b := make([]byte, n)
 	for i, cache, remain := n-1, rand.Int63(), letterIdxMax; i >= 0; {
@@ -51,9 +60,9 @@ func randHexString(n int) string {
 
 // measure latencies of at least our own messages
 type latencyMeter struct {
-	sent map[string]time.Time
+	sent     map[string]time.Time
 	received map[string]time.Time
-	mu sync.Mutex
+	mu       sync.Mutex
 }
 
 func (lm *latencyMeter) markSent(msg string) {
@@ -108,8 +117,14 @@ func main() {
 		return
 	}
 
+	account := os.Getenv("AWS_ACCOUNT")
+	if len(account) == 0 {
+		fmt.Println("AWS_ACCOUNT must be set!")
+		return
+	}
+
 	rand.Seed(time.Now().UnixNano())
-	
+
 	switch flag.Arg(0) {
 	case "publish":
 		if *R == 0 {
@@ -124,7 +139,7 @@ func main() {
 			close(done)
 		}()
 		latencyMeter := &latencyMeter{
-			sent: make(map[string]time.Time),
+			sent:     make(map[string]time.Time),
 			received: make(map[string]time.Time),
 		}
 		var totalReceived, totalSent int
@@ -136,7 +151,7 @@ func main() {
 			wg.Done()
 		}()
 		go func() {
-			totalReceived, startSubscribe = subscribe(topic, region, latencyMeter, done)
+			totalReceived, startSubscribe = subscribe(topic, region, account, latencyMeter, done)
 			wg.Done()
 		}()
 		wg.Wait()
@@ -154,7 +169,7 @@ func main() {
 
 // publish
 func publish(topic, region string, r, b int, lm *latencyMeter, done chan struct{}) (total int, start time.Time) {
-        reg, ok := aws.Regions[region]
+	reg, ok := aws.Regions[region]
 	if !ok {
 		panic("unknown region")
 	}
@@ -166,14 +181,24 @@ func publish(topic, region string, r, b int, lm *latencyMeter, done chan struct{
 	limiter := rate.NewLimiter(rate.Limit(float64(r)), 100)
 	start = time.Now()
 	stop := false
+	var batch Batch
 	for !stop {
 		r := limiter.ReserveN(time.Now(), 1)
 		if r.OK() {
-			opts := &sns.PublishOpt{}
-			opts.Message = randHexString(64)
-			opts.TopicArn = topic
-			if _, err := mySns.Publish(opts); err != nil {
-				panic(err)
+			message := randHexString(64)
+			lm.markSent(message)
+			batch.Messages = append(batch.Messages, message)
+			if b == 0 || b%len(batch.Messages) == 0 {
+				opts := &sns.PublishOpt{}
+				msg, err := json.Marshal(batch)
+				if err != nil {
+					panic(err)
+				}
+				opts.TopicArn = topic
+				opts.Message = string(msg)
+				if _, err := mySns.Publish(opts); err != nil {
+					panic(err)
+				}
 			}
 			total++
 		}
@@ -187,8 +212,8 @@ func publish(topic, region string, r, b int, lm *latencyMeter, done chan struct{
 }
 
 // subscribe
-func subscribe(topic, region string, lm *latencyMeter, done chan struct{}) (total int, start time.Time) {
-        r, ok := aws.Regions[region]
+func subscribe(topic, region, account string, lm *latencyMeter, done chan struct{}) (total int, start time.Time) {
+	r, ok := aws.Regions[region]
 	if !ok {
 		panic("unknown region")
 	}
@@ -196,25 +221,49 @@ func subscribe(topic, region string, lm *latencyMeter, done chan struct{}) (tota
 	if err != nil {
 		panic(err)
 	}
-
+	// create the queue inbox
 	mySqs := sqs.New(auth, r)
 	queueName := "queue-" + randHexString(32)
-	queue, err := mySqs.CreateQueue(queueName)
+	queueArn := "arn:aws:sqs:us-east-1:" + account + ":" + queueName
+	// yes this is ugly
+	policy := "{" +
+		"  \"Version\": \"2012-10-17\"," +
+		"  \"Id\": \"" + queueArn + "/SQSDefaultPolicy\"," +
+		"  \"Statement\": [" +
+		"    {" +
+		"      \"Sid\": \"Sid1458088770280\"," +
+		"      \"Effect\": \"Allow\"," +
+		"      \"Principal\": \"*\"," +
+		"      \"Action\": \"SQS:SendMessage\"," +
+		"      \"Resource\": \"" + queueArn + "\"" +
+		"    }" +
+		"  ]" +
+		"}"
+	attrs := map[string]string{
+		"Policy": policy,
+	}
+	queue, err := mySqs.CreateQueueWithAttributes(queueName, attrs)
 	if err != nil {
 		panic(err)
 	}
 
 	// subscribe
 	mySns := sns.New(auth, r)
-	if _, err := mySns.Subscribe(queue.Url, "sqs", topic); err != nil {
+	subResp, err := mySns.Subscribe(queueArn, "sqs", topic)
+	if err != nil {
 		panic(err)
 	}
-	
+
 	var mu sync.Mutex
 	for i := 0; i < NUM_SUBSCRIBER_THREADS; i++ {
 		go func() {
 			for {
-				resp, err := queue.ReceiveMessage(1000)
+				// these are the max values
+				params := map[string]string{
+					"MaxNumberOfMessages": "10",
+					"WaitTimeSeconds":     "20",
+				}
+				resp, err := queue.ReceiveMessageWithParameters(params)
 				if err != nil {
 					fmt.Println(err)
 					return
@@ -228,16 +277,29 @@ func subscribe(topic, region string, lm *latencyMeter, done chan struct{}) (tota
 					}
 				}
 				for _, msg := range resp.Messages {
-					lm.markReceived(msg.Body)
-					mu.Lock()
-					total++
-					mu.Unlock()
+					var m JSONMessage
+					if err := json.Unmarshal([]byte(msg.Body), &m); err != nil {
+						panic(err)
+					}
+					var b Batch
+					if err := json.Unmarshal([]byte(m.Message), &b); err != nil {
+						panic(err)
+					}
+					for _, s := range b.Messages {
+						fmt.Println(s)
+						lm.markReceived(s)
+						mu.Lock()
+						total++
+						mu.Unlock()
+					}
 				}
 			}
 		}()
 	}
-	// leaking goroutines but we're exiting anyway...
-        <-done
+	<-done
+	if _, err := mySns.Unsubscribe(subResp.SubscriptionArn); err != nil {
+		panic(err)
+	}
 	if _, err := queue.Delete(); err != nil {
 		panic(err)
 	}
@@ -245,6 +307,6 @@ func subscribe(topic, region string, lm *latencyMeter, done chan struct{}) (tota
 	mu.Lock()
 	t := total
 	mu.Unlock()
-	
+
 	return t, start
 }
