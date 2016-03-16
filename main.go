@@ -199,6 +199,7 @@ func publish(topic, region string, r, b int, lm *latencyMeter, done chan struct{
 				if _, err := mySns.Publish(opts); err != nil {
 					panic(err)
 				}
+				batch.Messages = make([]string, 0)
 			}
 			total++
 		}
